@@ -20,9 +20,21 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/path" \
+            zricethezav/gitleaks:latest \
+            detect \
+            --source=/path \
+            --report-format=json \
+            --report-path=/path/gitleaks-report.json
+
+      - name: Upload Gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
 
   codeql:
     name: CodeQL (Python)
@@ -62,18 +74,17 @@ jobs:
 
       - name: Run Bandit (dangerous Python patterns)
         run: |
-          bandit -r . -x .git,.venv,venv,__pycache__ -ll -ii -f txt -o bandit-report.txt
+          bandit -r . -x .git,.venv,venv,__pycache__ -f json -o bandit-report.json
 
       - name: Upload Bandit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bandit-report
-          path: bandit-report.txt
+          path: bandit-report.json
 
       - name: Run Semgrep (SQLi, injections, CSRF, secrets)
         run: |
-          set +e
           semgrep scan \
             --config p/security-audit \
             --config p/python \
@@ -81,15 +92,19 @@ jobs:
             --sarif \
             --output semgrep.sarif \
             .
-          exit_code=$?
-          set -e
-          exit $exit_code
 
       - name: Upload Semgrep SARIF
         if: always() && hashFiles('semgrep.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep.sarif
+
+      - name: Upload Semgrep report
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
 
   dependency-review:
     name: Dependency Review (PR)
@@ -130,6 +145,13 @@ jobs:
         with:
           sarif_file: snyk-code.sarif
 
+      - name: Upload Snyk Code report
+        if: always() && env.SNYK_TOKEN != '' && hashFiles('snyk-code.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-code-sarif
+          path: snyk-code.sarif
+
       - name: Run Snyk Open Source test (dependencies)
         if: env.SNYK_TOKEN != ''
         run: |
@@ -138,3 +160,141 @@ jobs:
           else
             echo "No dependency manifest found, skipping Snyk Open Source test."
           fi
+
+  vulnerability-report:
+    name: Vulnerability Report (Markdown)
+    if: always()
+    needs:
+      - secret-scan
+      - codeql
+      - python-security
+      - dependency-review
+      - snyk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-artifacts
+
+      - name: Build vulnerability report
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('scan-artifacts')
+          report = [
+              '# Vulnerabilities',
+              '',
+              'Aggregated report generated from the latest CI run.',
+              '',
+          ]
+
+          def load_json(path):
+              try:
+                  return json.loads(path.read_text(encoding='utf-8'))
+              except Exception:
+                  return None
+
+          def sarif_findings(path):
+              data = load_json(path)
+              if not data:
+                  return []
+              findings = []
+              for run in data.get('runs', []):
+                  for item in run.get('results', []):
+                      locations = item.get('locations') or []
+                      location = locations[0].get('physicalLocation', {}) if locations else {}
+                      artifact = location.get('artifactLocation', {}).get('uri', 'unknown')
+                      region = location.get('region', {})
+                      findings.append({
+                          'rule': item.get('ruleId', 'unknown'),
+                          'message': item.get('message', {}).get('text', ''),
+                          'file': artifact,
+                          'line': region.get('startLine', ''),
+                          'severity': item.get('level', ''),
+                      })
+              return findings
+
+          def bandit_findings(path):
+              data = load_json(path)
+              if not data:
+                  return []
+              findings = []
+              for item in data.get('results', []):
+                  findings.append({
+                      'rule': item.get('test_id', item.get('test_name', 'bandit')),
+                      'message': item.get('issue_text', ''),
+                      'file': item.get('filename', 'unknown'),
+                      'line': item.get('line_number', ''),
+                      'severity': item.get('issue_severity', ''),
+                  })
+              return findings
+
+          def gitleaks_findings(path):
+              data = load_json(path)
+              if not data:
+                  return []
+              if isinstance(data, dict):
+                  data = data.get('findings') or data.get('results') or []
+              findings = []
+              for item in data:
+                  findings.append({
+                      'rule': item.get('RuleID', item.get('ruleID', 'gitleaks')),
+                      'message': item.get('Description', 'Secret detected'),
+                      'file': item.get('File', 'unknown'),
+                      'line': item.get('StartLine', ''),
+                      'severity': item.get('Severity', 'high'),
+                  })
+              return findings
+
+          sections = [
+              ('Gitleaks', gitleaks_findings, ['gitleaks-report/gitleaks-report.json']),
+              ('Bandit', bandit_findings, ['bandit-report/bandit-report.json']),
+              ('Semgrep', sarif_findings, ['semgrep-sarif/semgrep.sarif']),
+              ('Snyk Code', sarif_findings, ['snyk-code-sarif/snyk-code.sarif']),
+          ]
+
+          for title, finder, paths in sections:
+              report.append(f'## {title}')
+              existing = [root / rel for rel in paths if (root / rel).exists()]
+              if not existing:
+                  report.append('- No artifact was produced for this scan in this run.')
+                  report.append('')
+                  continue
+
+              findings = []
+              for path in existing:
+                  findings.extend(finder(path))
+
+              report.append(f'- Findings: {len(findings)}')
+              if not findings:
+                  report.append('- No findings reported.')
+                  report.append('')
+                  continue
+
+              report.append('')
+              report.append('| Severity | Rule | File | Line | Message |')
+              report.append('| --- | --- | --- | --- | --- |')
+              for finding in findings[:50]:
+                  severity = str(finding.get('severity', '')).upper() or 'UNKNOWN'
+                  rule = str(finding.get('rule', 'unknown'))
+                  file = str(finding.get('file', 'unknown'))
+                  line = str(finding.get('line', ''))
+                  message = str(finding.get('message', '')).replace('|', '\\|')
+                  report.append(f'| {severity} | {rule} | {file} | {line} | {message} |')
+              report.append('')
+
+          report.append('## Notes')
+          report.append('- CodeQL findings are published to GitHub Security and are not duplicated in this Markdown artifact.')
+          report.append('- This file is generated on each workflow run and uploaded as an artifact for centralized review.')
+
+          Path('VULNERABILITIES.md').write_text('\n'.join(report) + '\n', encoding='utf-8')
+          PY
+
+      - name: Upload vulnerability report
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnerabilities-report
+          path: VULNERABILITIES.md
