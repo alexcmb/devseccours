@@ -101,30 +101,34 @@ jobs:
 
   snyk:
     name: Snyk (Code + Dependencies)
-    if: ${{ secrets.SNYK_TOKEN != '' }}
     runs-on: ubuntu-latest
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Snyk
+        if: env.SNYK_TOKEN != ''
         uses: snyk/actions/setup@master
 
+      - name: Skip Snyk when token is missing
+        if: env.SNYK_TOKEN == ''
+        run: echo "SNYK_TOKEN is not set. Skipping Snyk scans."
+
       - name: Run Snyk Code test (SAST)
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        if: env.SNYK_TOKEN != ''
         run: |
           snyk code test --severity-threshold=medium --sarif-file-output=snyk-code.sarif
 
       - name: Upload Snyk Code SARIF
-        if: always()
+        if: always() && env.SNYK_TOKEN != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: snyk-code.sarif
 
       - name: Run Snyk Open Source test (dependencies)
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        if: env.SNYK_TOKEN != ''
         run: |
           if [ -f requirements.txt ] || [ -f Pipfile ] || [ -f pyproject.toml ] || [ -f poetry.lock ]; then
             snyk test --all-projects --detection-depth=4 --severity-threshold=high
