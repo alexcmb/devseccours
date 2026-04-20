@@ -100,3 +100,36 @@ jobs:
 
       - name: Dependency Review
         uses: actions/dependency-review-action@v4
+
+  snyk:
+    name: Snyk (Code + Dependencies)
+    if: ${{ secrets.SNYK_TOKEN != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Snyk
+        uses: snyk/actions/setup@master
+
+      - name: Run Snyk Code test (SAST)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk code test --severity-threshold=medium --sarif-file-output=snyk-code.sarif
+
+      - name: Upload Snyk Code SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-code.sarif
+
+      - name: Run Snyk Open Source test (dependencies)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -f requirements.txt ] || [ -f Pipfile ] || [ -f pyproject.toml ] || [ -f poetry.lock ]; then
+            snyk test --all-projects --detection-depth=4 --severity-threshold=high
+          else
+            echo "No dependency manifest found, skipping Snyk Open Source test."
+          fi
