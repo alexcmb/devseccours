@@ -448,7 +448,7 @@ def transactions():
     else:
         html += '<p style="text-align: center; color: #666;">Aucune transaction enregistrée.</p>'
     
-    html += '<center><a href="/" class="back-link">← Retour à l'accueil</a></center></div></body></html>'
+    html += '<center><a href="/" class="back-link">← Retour à laccueil</a></center></div></body></html>'
     return html
 
 if __name__ == '__main__':
